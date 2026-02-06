@@ -12,6 +12,7 @@ import {
   PartByIndexProvider,
   TextMessagePartProvider,
 } from "../../context/providers";
+import { ChainOfThoughtByIndicesProvider } from "../../context/providers/ChainOfThoughtByIndicesProvider";
 import { MessagePartPrimitiveText } from "../messagePart/MessagePartText";
 import { MessagePartPrimitiveImage } from "../messagePart/MessagePartImage";
 import type {
@@ -33,13 +34,16 @@ import { useShallow } from "zustand/shallow";
 type MessagePartRange =
   | { type: "single"; index: number }
   | { type: "toolGroup"; startIndex: number; endIndex: number }
-  | { type: "reasoningGroup"; startIndex: number; endIndex: number };
+  | { type: "reasoningGroup"; startIndex: number; endIndex: number }
+  | { type: "chainOfThoughtGroup"; startIndex: number; endIndex: number };
 
 /**
  * Creates a group state manager for a specific part type.
  * Returns functions to start, end, and finalize groups.
  */
-const createGroupState = <T extends "toolGroup" | "reasoningGroup">(
+const createGroupState = <
+  T extends "toolGroup" | "reasoningGroup" | "chainOfThoughtGroup",
+>(
   groupType: T,
 ) => {
   let start = -1;
@@ -75,37 +79,59 @@ const createGroupState = <T extends "toolGroup" | "reasoningGroup">(
 /**
  * Groups consecutive tool-call and reasoning message parts into ranges.
  * Always groups tool calls and reasoning parts, even if there's only one.
+ * When useChainOfThought is true, groups tool-call and reasoning parts together.
  */
 const groupMessageParts = (
   messageTypes: readonly string[],
+  useChainOfThought: boolean,
 ): MessagePartRange[] => {
   const ranges: MessagePartRange[] = [];
-  const toolGroup = createGroupState("toolGroup");
-  const reasoningGroup = createGroupState("reasoningGroup");
 
-  for (let i = 0; i < messageTypes.length; i++) {
-    const type = messageTypes[i];
+  if (useChainOfThought) {
+    const chainOfThoughtGroup = createGroupState("chainOfThoughtGroup");
 
-    if (type === "tool-call") {
-      reasoningGroup.endGroup(i - 1, ranges);
-      toolGroup.startGroup(i);
-    } else if (type === "reasoning") {
-      toolGroup.endGroup(i - 1, ranges);
-      reasoningGroup.startGroup(i);
-    } else {
-      toolGroup.endGroup(i - 1, ranges);
-      reasoningGroup.endGroup(i - 1, ranges);
-      ranges.push({ type: "single", index: i });
+    for (let i = 0; i < messageTypes.length; i++) {
+      const type = messageTypes[i];
+
+      if (type === "tool-call" || type === "reasoning") {
+        chainOfThoughtGroup.startGroup(i);
+      } else {
+        chainOfThoughtGroup.endGroup(i - 1, ranges);
+        ranges.push({ type: "single", index: i });
+      }
     }
-  }
 
-  toolGroup.finalize(messageTypes.length - 1, ranges);
-  reasoningGroup.finalize(messageTypes.length - 1, ranges);
+    chainOfThoughtGroup.finalize(messageTypes.length - 1, ranges);
+  } else {
+    const toolGroup = createGroupState("toolGroup");
+    const reasoningGroup = createGroupState("reasoningGroup");
+
+    for (let i = 0; i < messageTypes.length; i++) {
+      const type = messageTypes[i];
+
+      if (type === "tool-call") {
+        reasoningGroup.endGroup(i - 1, ranges);
+        toolGroup.startGroup(i);
+      } else if (type === "reasoning") {
+        toolGroup.endGroup(i - 1, ranges);
+        reasoningGroup.startGroup(i);
+      } else {
+        toolGroup.endGroup(i - 1, ranges);
+        reasoningGroup.endGroup(i - 1, ranges);
+        ranges.push({ type: "single", index: i });
+      }
+    }
+
+    toolGroup.finalize(messageTypes.length - 1, ranges);
+    reasoningGroup.finalize(messageTypes.length - 1, ranges);
+  }
 
   return ranges;
 };
 
-const useMessagePartsGroups = (): MessagePartRange[] => {
+const useMessagePartsGroups = (
+  useChainOfThought: boolean,
+): MessagePartRange[] => {
   const messageTypes = useAuiState(
     useShallow((s) => s.message.parts.map((c: any) => c.type)),
   );
@@ -114,134 +140,167 @@ const useMessagePartsGroups = (): MessagePartRange[] => {
     if (messageTypes.length === 0) {
       return [];
     }
-    return groupMessageParts(messageTypes);
-  }, [messageTypes]);
+    return groupMessageParts(messageTypes, useChainOfThought);
+  }, [messageTypes, useChainOfThought]);
 };
 
 export namespace MessagePrimitiveParts {
+  type BaseComponents = {
+    /** Component for rendering empty messages */
+    Empty?: EmptyMessagePartComponent | undefined;
+    /** Component for rendering text content */
+    Text?: TextMessagePartComponent | undefined;
+    /** Component for rendering source content */
+    Source?: SourceMessagePartComponent | undefined;
+    /** Component for rendering image content */
+    Image?: ImageMessagePartComponent | undefined;
+    /** Component for rendering file content */
+    File?: FileMessagePartComponent | undefined;
+    /** Component for rendering audio content (experimental) */
+    Unstable_Audio?: Unstable_AudioMessagePartComponent | undefined;
+  };
+
+  type ToolsConfig =
+    | {
+        /** Map of tool names to their specific components */
+        by_name?:
+          | Record<string, ToolCallMessagePartComponent | undefined>
+          | undefined;
+        /** Fallback component for unregistered tools */
+        Fallback?: ComponentType<ToolCallMessagePartProps> | undefined;
+      }
+    | {
+        /** Override component that handles all tool calls */
+        Override: ComponentType<ToolCallMessagePartProps>;
+      };
+
+  /**
+   * Standard component configuration for rendering reasoning and tool-call parts
+   * individually (with optional grouping).
+   *
+   * Cannot be combined with `ChainOfThought`.
+   */
+  type StandardComponents = BaseComponents & {
+    /** Component for rendering reasoning content (typically hidden) */
+    Reasoning?: ReasoningMessagePartComponent | undefined;
+    /** Configuration for tool call rendering */
+    tools?: ToolsConfig | undefined;
+
+    /**
+     * Component for rendering grouped consecutive tool calls.
+     *
+     * When provided, this component will automatically wrap consecutive tool-call
+     * message parts, allowing you to create collapsible sections, custom styling,
+     * or other grouped presentations for multiple tool calls.
+     *
+     * The component receives:
+     * - `startIndex`: The index of the first tool call in the group
+     * - `endIndex`: The index of the last tool call in the group
+     * - `children`: The rendered tool call components
+     *
+     * @example
+     * ```tsx
+     * // Collapsible tool group
+     * ToolGroup: ({ startIndex, endIndex, children }) => (
+     *   <details className="tool-group">
+     *     <summary>
+     *       {endIndex - startIndex + 1} tool calls
+     *     </summary>
+     *     <div className="tool-group-content">
+     *       {children}
+     *     </div>
+     *   </details>
+     * )
+     * ```
+     *
+     * @param startIndex - Index of the first tool call in the group
+     * @param endIndex - Index of the last tool call in the group
+     * @param children - Rendered tool call components to display within the group
+     *
+     * @deprecated This feature is still experimental and subject to change.
+     */
+    ToolGroup?: ComponentType<
+      PropsWithChildren<{ startIndex: number; endIndex: number }>
+    >;
+
+    /**
+     * Component for rendering grouped reasoning parts.
+     *
+     * When provided, this component will automatically wrap reasoning message parts
+     * (one or more consecutive) in a group container. Each reasoning part inside
+     * renders its own text independently - no text merging occurs.
+     *
+     * The component receives:
+     * - `startIndex`: The index of the first reasoning part in the group
+     * - `endIndex`: The index of the last reasoning part in the group
+     * - `children`: The rendered Reasoning components (one per part)
+     *
+     * @example
+     * ```tsx
+     * // Collapsible reasoning group
+     * ReasoningGroup: ({ children }) => (
+     *   <details className="reasoning-group">
+     *     <summary>Reasoning</summary>
+     *     <div className="reasoning-content">
+     *       {children}
+     *     </div>
+     *   </details>
+     * )
+     * ```
+     *
+     * @param startIndex - Index of the first reasoning part in the group
+     * @param endIndex - Index of the last reasoning part in the group
+     * @param children - Rendered reasoning part components
+     */
+    ReasoningGroup?: ReasoningGroupComponent;
+
+    ChainOfThought?: never;
+  };
+
+  /**
+   * Chain of thought component configuration.
+   *
+   * When `ChainOfThought` is set, it takes control of rendering ALL reasoning and
+   * tool-call parts in the message. The `Reasoning`, `tools`, `ReasoningGroup`, and
+   * `ToolGroup` components cannot be used alongside it.
+   *
+   * The component is automatically wrapped in a ChainOfThoughtByIndicesProvider
+   * that sets up the chainOfThought client scope with the correct parts.
+   *
+   * @example
+   * ```tsx
+   * // Chain of thought with accordion
+   * ChainOfThought: () => (
+   *   <ChainOfThoughtPrimitive.Root>
+   *     <ChainOfThoughtPrimitive.AccordionTrigger>
+   *       Toggle reasoning
+   *     </ChainOfThoughtPrimitive.AccordionTrigger>
+   *     <ChainOfThoughtPrimitive.Parts />
+   *   </ChainOfThoughtPrimitive.Root>
+   * )
+   * ```
+   */
+  type ChainOfThoughtComponents = BaseComponents & {
+    ChainOfThought: ComponentType;
+
+    Reasoning?: never;
+    tools?: never;
+    ToolGroup?: never;
+    ReasoningGroup?: never;
+  };
+
   export type Props = {
     /**
      * Component configuration for rendering different types of message content.
      *
      * You can provide custom components for each content type (text, image, file, etc.)
      * and configure tool rendering behavior. If not provided, default components will be used.
+     *
+     * Use either `Reasoning`/`tools`/`ToolGroup`/`ReasoningGroup` for standard rendering,
+     * or `ChainOfThought` to group all reasoning and tool-call parts into a single
+     * collapsible component. These two modes are mutually exclusive.
      */
-    components?:
-      | {
-          /** Component for rendering empty messages */
-          Empty?: EmptyMessagePartComponent | undefined;
-          /** Component for rendering text content */
-          Text?: TextMessagePartComponent | undefined;
-          /** Component for rendering reasoning content (typically hidden) */
-          Reasoning?: ReasoningMessagePartComponent | undefined;
-          /** Component for rendering source content */
-          Source?: SourceMessagePartComponent | undefined;
-          /** Component for rendering image content */
-          Image?: ImageMessagePartComponent | undefined;
-          /** Component for rendering file content */
-          File?: FileMessagePartComponent | undefined;
-          /** Component for rendering audio content (experimental) */
-          Unstable_Audio?: Unstable_AudioMessagePartComponent | undefined;
-          /** Configuration for tool call rendering */
-          tools?:
-            | {
-                /** Map of tool names to their specific components */
-                by_name?:
-                  | Record<string, ToolCallMessagePartComponent | undefined>
-                  | undefined;
-                /** Fallback component for unregistered tools */
-                Fallback?: ComponentType<ToolCallMessagePartProps> | undefined;
-              }
-            | {
-                /** Override component that handles all tool calls */
-                Override: ComponentType<ToolCallMessagePartProps>;
-              }
-            | undefined;
-
-          /**
-           * Component for rendering grouped consecutive tool calls.
-           *
-           * When provided, this component will automatically wrap consecutive tool-call
-           * message parts, allowing you to create collapsible sections, custom styling,
-           * or other grouped presentations for multiple tool calls.
-           *
-           * The component receives:
-           * - `startIndex`: The index of the first tool call in the group
-           * - `endIndex`: The index of the last tool call in the group
-           * - `children`: The rendered tool call components
-           *
-           * @example
-           * ```tsx
-           * // Collapsible tool group
-           * ToolGroup: ({ startIndex, endIndex, children }) => (
-           *   <details className="tool-group">
-           *     <summary>
-           *       {endIndex - startIndex + 1} tool calls
-           *     </summary>
-           *     <div className="tool-group-content">
-           *       {children}
-           *     </div>
-           *   </details>
-           * )
-           * ```
-           *
-           * @example
-           * ```tsx
-           * // Custom styled tool group with header
-           * ToolGroup: ({ startIndex, endIndex, children }) => (
-           *   <div className="border rounded-lg p-4 my-2">
-           *     <div className="text-sm text-gray-600 mb-2">
-           *       Tool execution #{startIndex + 1}-{endIndex + 1}
-           *     </div>
-           *     <div className="space-y-2">
-           *       {children}
-           *     </div>
-           *   </div>
-           * )
-           * ```
-           *
-           * @param startIndex - Index of the first tool call in the group
-           * @param endIndex - Index of the last tool call in the group
-           * @param children - Rendered tool call components to display within the group
-           *
-           * @deprecated This feature is still experimental and subject to change.
-           */
-          ToolGroup?: ComponentType<
-            PropsWithChildren<{ startIndex: number; endIndex: number }>
-          >;
-
-          /**
-           * Component for rendering grouped reasoning parts.
-           *
-           * When provided, this component will automatically wrap reasoning message parts
-           * (one or more consecutive) in a group container. Each reasoning part inside
-           * renders its own text independently - no text merging occurs.
-           *
-           * The component receives:
-           * - `startIndex`: The index of the first reasoning part in the group
-           * - `endIndex`: The index of the last reasoning part in the group
-           * - `children`: The rendered Reasoning components (one per part)
-           *
-           * @example
-           * ```tsx
-           * // Collapsible reasoning group
-           * ReasoningGroup: ({ children }) => (
-           *   <details className="reasoning-group">
-           *     <summary>Reasoning</summary>
-           *     <div className="reasoning-content">
-           *       {children}
-           *     </div>
-           *   </details>
-           * )
-           * ```
-           *
-           * @param startIndex - Index of the first reasoning part in the group
-           * @param endIndex - Index of the last reasoning part in the group
-           * @param children - Rendered reasoning part components
-           */
-          ReasoningGroup?: ReasoningGroupComponent;
-        }
-      | undefined;
+    components?: StandardComponents | ChainOfThoughtComponents | undefined;
     /**
      * When enabled, shows the Empty component if the last part in the message
      * is anything other than Text or Reasoning.
@@ -293,7 +352,7 @@ type MessagePartComponentProps = {
   components: MessagePrimitiveParts.Props["components"];
 };
 
-const MessagePartComponent: FC<MessagePartComponentProps> = ({
+export const MessagePartComponent: FC<MessagePartComponentProps> = ({
   components: {
     Text = defaultComponents.Text,
     Reasoning = defaultComponents.Reasoning,
@@ -493,7 +552,8 @@ export const MessagePrimitiveParts: FC<MessagePrimitiveParts.Props> = ({
   unstable_showEmptyOnNonTextEnd = true,
 }) => {
   const contentLength = useAuiState(({ message }) => message.parts.length);
-  const messageRanges = useMessagePartsGroups();
+  const useChainOfThought = !!components?.ChainOfThought;
+  const messageRanges = useMessagePartsGroups(useChainOfThought);
 
   const partsElements = useMemo(() => {
     if (contentLength === 0) {
@@ -508,6 +568,18 @@ export const MessagePrimitiveParts: FC<MessagePrimitiveParts.Props> = ({
             index={range.index}
             components={components}
           />
+        );
+      } else if (range.type === "chainOfThoughtGroup") {
+        const ChainOfThoughtComponent = components?.ChainOfThought;
+        if (!ChainOfThoughtComponent) return null;
+        return (
+          <ChainOfThoughtByIndicesProvider
+            key={`chainOfThought-${range.startIndex}`}
+            startIndex={range.startIndex}
+            endIndex={range.endIndex}
+          >
+            <ChainOfThoughtComponent />
+          </ChainOfThoughtByIndicesProvider>
         );
       } else if (range.type === "toolGroup") {
         const ToolGroupComponent =
