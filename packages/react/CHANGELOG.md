@@ -1,5 +1,11 @@
 # @assistant-ui/react
 
+## 0.12.10
+
+### Patch Changes
+
+- 6a3b8d9: feat(assistant-transport): support editing messages
+
 ## 0.12.9
 
 ### Patch Changes
